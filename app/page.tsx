@@ -67,6 +67,7 @@ export default function Home() {
   const [currentlyPlaying, setCurrentlyPlaying] = useState<string | null>(null)
   const [isExporting, setIsExporting] = useState(false)
   const [exportMessage, setExportMessage] = useState<string | null>(null)
+  const [exportPercent, setExportPercent] = useState<number>(0)
 
   const TARGET_WIDTH = 1080
   const TARGET_HEIGHT = 1920
@@ -141,7 +142,9 @@ export default function Home() {
     ctx.textBaseline = "middle"
     const maxTextWidth = Math.floor(TARGET_WIDTH * 0.8)
     const lines = wrapTextToLines(ctx, text, maxTextWidth)
-    const lineHeight = parseInt(ctx.font.match(/(\d+)px/)?[1] ?? "56") * 1.25
+    const fontSizeMatch = ctx.font.match(/(\d+)px/)
+    const fontPx = fontSizeMatch ? fontSizeMatch[1] : "56"
+    const lineHeight = parseInt(fontPx) * 1.25
     let centerY = TARGET_HEIGHT / 2
     if (textPosition === "top") centerY = 200
     if (textPosition === "bottom") centerY = TARGET_HEIGHT - 200
@@ -314,6 +317,7 @@ export default function Home() {
     if (uploadedFiles.length === 0) return
     if (demoVideos.length === 0) return
     setIsExporting(true)
+    setExportPercent(0)
     setExportMessage("Preparing encoder...")
     try {
       const ffmpeg = await ensureFfmpegLoaded()
@@ -326,10 +330,21 @@ export default function Home() {
         console.warn(`Skipping ${skipped} non-video background(s).`)
       }
 
+      const total = videoBackgrounds.length
       let index = 0
+      let currentIndexForProgress = 0
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ffmpeg.on("progress", (p: any) => {
+        const ratio = typeof p?.progress === "number" ? p.progress : 0
+        if (total > 0) {
+          setExportPercent(Math.min(99, Math.floor(((currentIndexForProgress - 1) + ratio) / total * 100)))
+        }
+      })
       for (const bg of videoBackgrounds) {
         index += 1
-        setExportMessage(`Processing ${index}/${videoBackgrounds.length}...`)
+        currentIndexForProgress = index
+        setExportMessage(`Processing ${index}/${total}...`)
+        setExportPercent(Math.floor(((index - 1) / total) * 100))
 
         // Clean per-iteration files if they exist
         const cleanup = async () => {
@@ -345,11 +360,16 @@ export default function Home() {
         await ffmpeg.writeFile("bg.mp4", (await fetchFile(bg.file)) as Uint8Array)
         await ffmpeg.writeFile("demo.mp4", (await fetchFile(demoVideos[0].file)) as Uint8Array)
         if (music) {
-          await ffmpeg.writeFile(`music.${music.ext}`, music.bytes)
+          // Clone to avoid reusing a detached buffer between iterations
+          const musicClone = new Uint8Array(music.bytes)
+          await ffmpeg.writeFile(`music.${music.ext}`, musicClone)
         }
         if (overlayPng) {
-          await ffmpeg.writeFile("overlay.png", overlayPng)
+          const overlayClone = new Uint8Array(overlayPng)
+          await ffmpeg.writeFile("overlay.png", overlayClone)
         }
+
+        // Per-clip progress handled by global listener above
 
         const inputs: string[] = ["-i", "bg.mp4", "-i", "demo.mp4"]
         if (music) inputs.push("-stream_loop", "-1", "-i", `music.${music.ext}`)
@@ -412,9 +432,11 @@ export default function Home() {
         URL.revokeObjectURL(url)
 
         await cleanup()
+        setExportPercent(Math.floor((index / total) * 100))
       }
 
       setExportMessage("Done! Downloads should start automatically.")
+      setExportPercent(100)
     } catch (err) {
       console.error(err)
       setExportMessage("Export failed. See console for details.")
@@ -823,7 +845,10 @@ export default function Home() {
                   <h2 className="text-xl font-semibold text-gray-900 mb-2">Exporting Your Videos</h2>
                   <p className="text-gray-600 mb-4">Please wait while we process your videos...</p>
                   <div className="bg-gray-200 rounded-full h-2 mb-4">
-                    <div className="bg-gray-900 h-2 rounded-full animate-pulse" style={{ width: "60%" }}></div>
+                    <div
+                      className="bg-gray-900 h-2 rounded-full transition-all"
+                      style={{ width: `${exportPercent}%` }}
+                    ></div>
                   </div>
                   <p className="text-sm text-gray-500">
                     This may take a few minutes depending on video length and quality.
