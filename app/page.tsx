@@ -2,6 +2,8 @@
 import TopNav from "@/components/top-nav"
 import { Plus, X, ChevronLeft, ChevronRight } from "lucide-react"
 import { useRef, useState } from "react"
+import { FFmpeg } from "@ffmpeg/ffmpeg"
+import { fetchFile, toBlobURL } from "@ffmpeg/util"
 
 interface UploadedFile {
   file: File
@@ -52,6 +54,7 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const demoFileInputRef = useRef<HTMLInputElement>(null)
   const musicFileInputRef = useRef<HTMLInputElement>(null)
+  const ffmpegRef = useRef<FFmpeg | null>(null)
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
   const [demoVideos, setDemoVideos] = useState<UploadedFile[]>([])
   const [customMusicFiles, setCustomMusicFiles] = useState<UploadedFile[]>([])
@@ -63,6 +66,117 @@ export default function Home() {
   const [selectedTrack, setSelectedTrack] = useState<string | null>(null)
   const [currentlyPlaying, setCurrentlyPlaying] = useState<string | null>(null)
   const [isExporting, setIsExporting] = useState(false)
+  const [exportMessage, setExportMessage] = useState<string | null>(null)
+
+  const TARGET_WIDTH = 1080
+  const TARGET_HEIGHT = 1920
+  const TARGET_FPS = 30
+
+  async function ensureFfmpegLoaded() {
+    if (ffmpegRef.current) return ffmpegRef.current
+    const ffmpeg = new FFmpeg()
+    // Optional: logs could be wired to UI
+    // ffmpeg.on("log", ({ message }) => console.log(message))
+    const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd"
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+    })
+    ffmpegRef.current = ffmpeg
+    return ffmpeg
+  }
+
+  function getCanvasFont(): string {
+    switch (textSize) {
+      case "small":
+        return "700 40px Arial, Helvetica, sans-serif"
+      case "large":
+        return "700 72px Arial, Helvetica, sans-serif"
+      case "extra-large":
+        return "800 96px Arial, Helvetica, sans-serif"
+      default:
+        return "700 56px Arial, Helvetica, sans-serif"
+    }
+  }
+
+  function getStrokePx(): number {
+    switch (textSize) {
+      case "small":
+        return 6
+      case "large":
+        return 8
+      case "extra-large":
+        return 10
+      default:
+        return 7
+    }
+  }
+
+  function wrapTextToLines(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+    const words = text.split(/\s+/)
+    const lines: string[] = []
+    let current = ""
+    for (const word of words) {
+      const test = current ? current + " " + word : word
+      const w = ctx.measureText(test).width
+      if (w > maxWidth && current) {
+        lines.push(current)
+        current = word
+      } else {
+        current = test
+      }
+    }
+    if (current) lines.push(current)
+    return lines
+  }
+
+  async function renderOverlayPng(text: string): Promise<Uint8Array> {
+    const canvas = document.createElement("canvas")
+    canvas.width = TARGET_WIDTH
+    canvas.height = TARGET_HEIGHT
+    const ctx = canvas.getContext("2d")!
+    ctx.clearRect(0, 0, TARGET_WIDTH, TARGET_HEIGHT)
+    ctx.font = getCanvasFont()
+    ctx.textAlign = "center"
+    ctx.textBaseline = "middle"
+    const maxTextWidth = Math.floor(TARGET_WIDTH * 0.8)
+    const lines = wrapTextToLines(ctx, text, maxTextWidth)
+    const lineHeight = parseInt(ctx.font.match(/(\d+)px/)?[1] ?? "56") * 1.25
+    let centerY = TARGET_HEIGHT / 2
+    if (textPosition === "top") centerY = 200
+    if (textPosition === "bottom") centerY = TARGET_HEIGHT - 200
+    const totalHeight = lines.length * lineHeight
+    const startY = centerY - totalHeight / 2
+    ctx.lineJoin = "round"
+    ctx.lineWidth = getStrokePx()
+    ctx.strokeStyle = "black"
+    ctx.fillStyle = "white"
+    lines.forEach((line, idx) => {
+      const y = startY + idx * lineHeight
+      ctx.strokeText(line, TARGET_WIDTH / 2, y)
+      ctx.fillText(line, TARGET_WIDTH / 2, y)
+    })
+    const blob: Blob = await new Promise((resolve) => canvas.toBlob((b) => resolve(b as Blob), "image/png"))
+    const buf = new Uint8Array(await blob.arrayBuffer())
+    return buf
+  }
+
+  async function resolveSelectedMusicBytes(): Promise<{ bytes: Uint8Array; ext: string } | null> {
+    if (!selectedTrack) return null
+    const predefined = predefinedTracks.find((t) => t.id === selectedTrack)
+    if (predefined) {
+      const res = await fetch(predefined.url)
+      const ab = await res.arrayBuffer()
+      return { bytes: new Uint8Array(ab), ext: "mp3" }
+    }
+    const custom = customMusicFiles.find((m) => m.id === selectedTrack)
+    if (custom) {
+      const bytes = await fetchFile(custom.file)
+      const ext = custom.file.name.split(".").pop() || "mp3"
+      return { bytes: bytes as Uint8Array, ext }
+    }
+    return null
+  }
 
   const handleFileSelect = (files: FileList | null) => {
     if (!files) return
@@ -196,18 +310,117 @@ export default function Home() {
     })
   }
 
-  const handleExport = () => {
+  const handleExport = async () => {
+    if (uploadedFiles.length === 0) return
+    if (demoVideos.length === 0) return
     setIsExporting(true)
+    setExportMessage("Preparing encoder...")
+    try {
+      const ffmpeg = await ensureFfmpegLoaded()
+      const music = await resolveSelectedMusicBytes()
+      const overlayPng = textContent ? await renderOverlayPng(textContent) : null
 
-    console.log("Exporting videos...")
-    console.log("Backgrounds:", uploadedFiles.length)
-    console.log("Demo videos:", demoVideos.length)
-    console.log("Text:", textContent)
-    console.log("Selected music:", selectedTrack)
+      const videoBackgrounds = uploadedFiles.filter((f) => f.file.type.startsWith("video/"))
+      const skipped = uploadedFiles.length - videoBackgrounds.length
+      if (skipped > 0) {
+        console.warn(`Skipping ${skipped} non-video background(s).`)
+      }
 
-    setTimeout(() => {
+      let index = 0
+      for (const bg of videoBackgrounds) {
+        index += 1
+        setExportMessage(`Processing ${index}/${videoBackgrounds.length}...`)
+
+        // Clean per-iteration files if they exist
+        const cleanup = async () => {
+          for (const f of ["bg.mp4", "demo.mp4", music ? `music.${music.ext}` : null, overlayPng ? "overlay.png" : null, "out.mp4"]) {
+            if (!f) continue
+            try {
+              await ffmpeg.deleteFile(f)
+            } catch {}
+          }
+        }
+        await cleanup()
+
+        await ffmpeg.writeFile("bg.mp4", (await fetchFile(bg.file)) as Uint8Array)
+        await ffmpeg.writeFile("demo.mp4", (await fetchFile(demoVideos[0].file)) as Uint8Array)
+        if (music) {
+          await ffmpeg.writeFile(`music.${music.ext}`, music.bytes)
+        }
+        if (overlayPng) {
+          await ffmpeg.writeFile("overlay.png", overlayPng)
+        }
+
+        const inputs: string[] = ["-i", "bg.mp4", "-i", "demo.mp4"]
+        if (music) inputs.push("-stream_loop", "-1", "-i", `music.${music.ext}`)
+        if (overlayPng) inputs.push("-i", "overlay.png")
+
+        const overlayIndex = overlayPng ? (music ? 3 : 2) : null
+        const yExpr = textPosition === "top" ? "120" : textPosition === "bottom" ? "main_h-overlay_h-120" : "(main_h-overlay_h)/2"
+        const overlayClause = overlayIndex !== null
+          ? `[vcat][${overlayIndex}:v]overlay=(main_w-overlay_w)/2:${yExpr}:format=auto,format=yuv420p[vout]`
+          : `[vcat]format=yuv420p[vout]`
+        const filter = `
+          [0:v]scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}[v0];
+          [1:v]scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS}[v1];
+          [v0][v1]concat=n=2:v=1:a=0[vcat];
+          ${overlayClause}
+        `.replace(/\n/g, "")
+
+        const baseArgs = [
+          ...inputs,
+          "-filter_complex",
+          filter,
+          "-map",
+          "[vout]",
+          ...(music ? ["-map", "2:a"] : []),
+          ...(music ? ["-shortest"] : []),
+          "-pix_fmt",
+          "yuv420p",
+          "-c:v",
+          "libx264",
+          "-preset",
+          "veryfast",
+          ...(music ? ["-c:a", "aac", "-b:a", "192k"] as const : []),
+          "out.mp4",
+        ] as string[]
+
+        async function runWithFallback() {
+          try {
+            await ffmpeg.exec(baseArgs)
+          } catch (e) {
+            console.warn("libx264 not available, retrying with mpeg4", e)
+            const alt = baseArgs.map((a) => a)
+            const cvi = alt.indexOf("libx264")
+            if (cvi !== -1) alt[cvi] = "mpeg4"
+            await ffmpeg.exec(alt)
+          }
+        }
+
+        await runWithFallback()
+
+        const data = (await ffmpeg.readFile("out.mp4")) as Uint8Array
+        const blob = new Blob([data], { type: "video/mp4" })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        const baseName = (bg.file.name || `background_${index}`).replace(/\.[^/.]+$/, "")
+        a.href = url
+        a.download = `${baseName}_export.mp4`
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+
+        await cleanup()
+      }
+
+      setExportMessage("Done! Downloads should start automatically.")
+    } catch (err) {
+      console.error(err)
+      setExportMessage("Export failed. See console for details.")
+    } finally {
       setIsExporting(false)
-    }, 5000) // Reset after 5 seconds for demo
+    }
   }
 
   return (
@@ -615,6 +828,9 @@ export default function Home() {
                   <p className="text-sm text-gray-500">
                     This may take a few minutes depending on video length and quality.
                   </p>
+                  {exportMessage && (
+                    <p className="text-xs text-gray-500 mt-1">{exportMessage}</p>
+                  )}
                 </div>
               ) : (
                 <>
