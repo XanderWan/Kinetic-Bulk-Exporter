@@ -4,8 +4,8 @@ import { GeistMono } from 'geist/font/mono'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'v0 App',
-  description: 'Created with v0',
+  title: 'Kinetic Bulk Exporter',
+  description: 'Bulk stitch backgrounds + demo + text + music, right in your browser',
   generator: 'v0.app',
 }
 
